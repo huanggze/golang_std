@@ -39,6 +39,12 @@ type Dialer struct {
 	// as with the Timeout option.
 	Deadline time.Time
 
+	// LocalAddr is the local address to use when dialing an
+	// address. The address must be of a compatible type for the
+	// network being dialed.
+	// If nil, a local address is automatically chosen.
+	LocalAddr Addr
+
 	// KeepAlive specifies the interval between keep-alive
 	// probes for an active network connection.
 	// If zero, keep-alive probes are sent with a default value
@@ -75,6 +81,30 @@ func (d *Dialer) deadline(ctx context.Context, now time.Time) (earliest time.Tim
 	return minNonzeroTime(earliest, d.Deadline)
 }
 
+// partialDeadline returns the deadline to use for a single address,
+// when multiple addresses are pending.
+func partialDeadline(now, deadline time.Time, addrsRemaining int) (time.Time, error) {
+	if deadline.IsZero() {
+		return deadline, nil
+	}
+	timeRemaining := deadline.Sub(now)
+	if timeRemaining <= 0 {
+		return time.Time{}, errTimeout
+	}
+	// Tentatively allocate equal time to each remaining address.
+	timeout := timeRemaining / time.Duration(addrsRemaining)
+	// If the time per address is too short, steal from the end of the list.
+	const saneMinimum = 2 * time.Second
+	if timeout < saneMinimum {
+		if timeRemaining < saneMinimum {
+			timeout = timeRemaining
+		} else {
+			timeout = saneMinimum
+		}
+	}
+	return now.Add(timeout), nil
+}
+
 // sysDialer contains a Dial's parameters and configuration.
 type sysDialer struct {
 	Dialer
@@ -102,10 +132,10 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (Conn
 		address: address,
 	}
 
-	var primaries, fallbacks addrList
+	var primaries addrList
 	primaries = addrs
 
-	c, err := sd.dialParallel(ctx, primaries, fallbacks)
+	c, err := sd.dialSerial(ctx, primaries)
 	if err != nil {
 		return nil, err
 	}
@@ -119,4 +149,48 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (Conn
 		setKeepAlivePeriod(tc.fd, ka)
 	}
 	return c, nil
+}
+
+// dialSerial connects to a list of addresses in sequence, returning
+// either the first successful connection, or the first error.
+func (sd *sysDialer) dialSerial(ctx context.Context, ras addrList) (Conn, error) {
+	var firstErr error // The error from the first address is most relevant.
+
+	for i, ra := range ras {
+		select {
+		case <-ctx.Done():
+			return nil, &OpError{Op: "dial", Net: sd.network, Source: sd.LocalAddr, Addr: ra, Err: mapErr(ctx.Err())}
+		default:
+		}
+
+		dialCtx := ctx
+		if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
+			partialDeadline, err := partialDeadline(time.Now(), deadline, len(ras)-i)
+			if err != nil {
+				// Ran out of time.
+				if firstErr == nil {
+					firstErr = &OpError{Op: "dial", Net: sd.network, Source: sd.LocalAddr, Addr: ra, Err: err}
+				}
+				break
+			}
+			if partialDeadline.Before(deadline) {
+				var cancel context.CancelFunc
+				dialCtx, cancel = context.WithDeadline(ctx, partialDeadline)
+				defer cancel()
+			}
+		}
+
+		c, err := sd.dialSingle(dialCtx, ra)
+		if err == nil {
+			return c, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	if firstErr == nil {
+		firstErr = &OpError{Op: "dial", Net: sd.network, Source: nil, Addr: nil, Err: errMissingAddress}
+	}
+	return nil, firstErr
 }

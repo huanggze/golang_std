@@ -1,6 +1,9 @@
 package net
 
-import "github.com/huanggze/std/internal/itoa"
+import (
+	"github.com/huanggze/src/internal/itoa"
+	"time"
+)
 
 // TCPAddr represents the address of a TCP end point.
 type TCPAddr struct {
@@ -27,4 +30,9 @@ func (a *TCPAddr) String() string {
 // connections.
 type TCPConn struct {
 	conn
+}
+
+// roundDurationUp rounds d to the next multiple of to.
+func roundDurationUp(d time.Duration, to time.Duration) time.Duration {
+	return (d + to - 1) / to
 }

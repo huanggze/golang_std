@@ -1,5 +1,10 @@
 package net
 
+import (
+	"context"
+	"errors"
+)
+
 // Addr represents a network end point address.
 //
 // The two methods Network and String conventionally return strings
@@ -16,3 +21,98 @@ type Conn interface {
 type conn struct {
 	fd *netFD
 }
+
+// Various errors contained in OpError.
+var (
+	// For connection setup and write operations.
+	errMissingAddress = errors.New("missing address")
+
+	// For both read and write operations.
+	errCanceled = errors.New("operation was canceled")
+)
+
+// mapErr maps from the context errors to the historical internal net
+// error values.
+//
+// TODO(bradfitz): get rid of this after adjusting tests and making
+// context.DeadlineExceeded implement net.Error?
+func mapErr(err error) error {
+	switch err {
+	case context.Canceled:
+		return errCanceled
+	case context.DeadlineExceeded:
+		return errTimeout
+	default:
+		return err
+	}
+}
+
+// OpError is the error type usually returned by functions in the net
+// package. It describes the operation, network type, and address of
+// an error.
+type OpError struct {
+	// Op is the operation which caused the error, such as
+	// "read" or "write".
+	Op string
+
+	// Net is the network type on which this error occurred,
+	// such as "tcp" or "udp6".
+	Net string
+
+	// For operations involving a remote network connection, like
+	// Dial, Read, or Write, Source is the corresponding local
+	// network address.
+	Source Addr
+
+	// Addr is the network address for which this error occurred.
+	// For local operations, like Listen or SetDeadline, Addr is
+	// the address of the local endpoint being manipulated.
+	// For operations involving a remote network connection, like
+	// Dial, Read, or Write, Addr is the remote address of that
+	// connection.
+	Addr Addr
+
+	// Err is the error that occurred during the operation.
+	// The Error method panics if the error is nil.
+	Err error
+}
+
+func (e *OpError) Unwrap() error { return e.Err }
+
+func (e *OpError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	s := e.Op
+	if e.Net != "" {
+		s += " " + e.Net
+	}
+	if e.Source != nil {
+		s += " " + e.Source.String()
+	}
+	if e.Addr != nil {
+		if e.Source != nil {
+			s += "->"
+		} else {
+			s += " "
+		}
+		s += e.Addr.String()
+	}
+	s += ": " + e.Err.Error()
+	return s
+}
+
+// errTimeout exists to return the historical "i/o timeout" string
+// for context.DeadlineExceeded. See mapErr.
+// It is also used when Dialer.Deadline is exceeded.
+//
+// TODO(iant): We could consider changing this to os.ErrDeadlineExceeded
+// in the future, but note that that would conflict with the TODO
+// at mapErr that suggests changing it to context.DeadlineExceeded.
+var errTimeout error = &timeoutError{}
+
+type timeoutError struct{}
+
+func (e *timeoutError) Error() string   { return "i/o timeout" }
+func (e *timeoutError) Timeout() bool   { return true }
+func (e *timeoutError) Temporary() bool { return true }
