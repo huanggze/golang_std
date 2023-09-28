@@ -3,6 +3,8 @@ package net
 import (
 	"context"
 	"errors"
+	"sync"
+	"time"
 )
 
 // Addr represents a network end point address.
@@ -16,10 +18,27 @@ type Addr interface {
 }
 
 type Conn interface {
+	// Write writes data to the connection.
+	// Write can be made to time out and return an error after a fixed
+	// time limit; see SetDeadline and SetWriteDeadline.
+	Write(b []byte) (n int, err error)
 }
 
 type conn struct {
 	fd *netFD
+}
+
+func (c *conn) ok() bool { return c != nil && c.fd != nil }
+
+var listenerBacklogCache struct {
+	sync.Once
+	val int
+}
+
+// listenerBacklog is a caching wrapper around maxListenerBacklog.
+func listenerBacklog() int {
+	listenerBacklogCache.Do(func() { listenerBacklogCache.val = maxListenerBacklog() })
+	return listenerBacklogCache.val
 }
 
 // Various errors contained in OpError.
@@ -101,6 +120,36 @@ func (e *OpError) Error() string {
 	s += ": " + e.Err.Error()
 	return s
 }
+
+var (
+	// aLongTimeAgo is a non-zero time, far in the past, used for
+	// immediate cancellation of dials.
+	aLongTimeAgo = time.Unix(1, 0)
+
+	// nonDeadline and noCancel are just zero values for
+	// readability with functions taking too many parameters.
+	noDeadline = time.Time{}
+	noCancel   = (chan struct{})(nil)
+)
+
+type AddrError struct {
+	Err  string
+	Addr string
+}
+
+func (e *AddrError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	s := e.Err
+	if e.Addr != "" {
+		s = "address " + e.Addr + ": " + s
+	}
+	return s
+}
+
+func (e *AddrError) Timeout() bool   { return false }
+func (e *AddrError) Temporary() bool { return false }
 
 // errTimeout exists to return the historical "i/o timeout" string
 // for context.DeadlineExceeded. See mapErr.

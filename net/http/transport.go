@@ -5,11 +5,13 @@ import (
 	"container/list"
 	"context"
 	"errors"
+	"io"
+	"net/http/httptrace"
 	"net/url"
 	"sync"
 	"time"
 
-	"github.com/huanggze/std/net"
+	"github.com/huanggze/src/net"
 )
 
 // DefaultTransport is the default implementation of Transport and is
@@ -62,6 +64,23 @@ type Transport struct {
 	// itself.
 	// Zero means no limit.
 	IdleConnTimeout time.Duration
+
+	// MaxResponseHeaderBytes specifies a limit on how many
+	// response bytes are allowed in the server's response
+	// header.
+	//
+	// Zero means to use a default limit.
+	MaxResponseHeaderBytes int64
+
+	// WriteBufferSize specifies the size of the write buffer used
+	// when writing to the transport.
+	// If zero, a default (currently 4KB) is used.
+	WriteBufferSize int
+
+	// ReadBufferSize specifies the size of the read buffer used
+	// when reading from the transport.
+	// If zero, a default (currently 4KB) is used.
+	ReadBufferSize int
 }
 
 // A cancelKey is the key of the reqCanceler map.
@@ -69,6 +88,20 @@ type Transport struct {
 // not any transient one created by roundTrip.
 type cancelKey struct {
 	req *Request
+}
+
+func (t *Transport) writeBufferSize() int {
+	if t.WriteBufferSize > 0 {
+		return t.WriteBufferSize
+	}
+	return 4 << 10
+}
+
+func (t *Transport) readBufferSize() int {
+	if t.ReadBufferSize > 0 {
+		return t.ReadBufferSize
+	}
+	return 4 << 10
 }
 
 // transportRequest is a wrapper around a *Request that adds
@@ -174,6 +207,7 @@ func (t *Transport) connectMethodForRequest(treq *transportRequest) (cm connectM
 
 // error values for debugging and testing, not seen by users.
 var (
+	errReadLoopExiting = errors.New("http: persistConn.readLoop exiting")
 	errIdleConnTimeout = errors.New("http: idle connection timeout")
 )
 
@@ -567,6 +601,33 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *pers
 	return pconn, nil
 }
 
+// persistConnWriter is the io.Writer written to by pc.bw.
+// It accumulates the number of bytes written to the underlying conn,
+// so the retry logic can determine whether any bytes made it across
+// the wire.
+// This is exactly 1 pointer field wide so it can go into an interface
+// without allocation.
+type persistConnWriter struct {
+	pc *persistConn
+}
+
+func (w persistConnWriter) Write(p []byte) (n int, err error) {
+	n, err = w.pc.conn.Write(p)
+	w.pc.nwrite += int64(n)
+	return
+}
+
+// ReadFrom exposes persistConnWriter's underlying Conn to io.Copy and if
+// the Conn implements io.ReaderFrom, it can take advantage of optimizations
+// such as sendfile.
+func (w persistConnWriter) ReadFrom(r io.Reader) (n int64, err error) {
+	n, err = io.Copy(w.pc.conn, r)
+	w.pc.nwrite += n
+	return
+}
+
+var _ io.ReaderFrom = (*persistConnWriter)(nil)
+
 // decConnsPerHost decrements the per-host connection count for key,
 // which may in turn give a different waiting goroutine permission to dial.
 func (t *Transport) decConnsPerHost(key connectMethodKey) {
@@ -680,11 +741,14 @@ type connectMethodKey struct {
 // persistConn wraps a connection, usually a persistent one
 // (but may be used for non-keep-alive requests as well)
 type persistConn struct {
-	t        *Transport
-	cacheKey connectMethodKey
-	conn     net.Conn
-	br       *bufio.Reader // from conn
-	bw       *bufio.Writer // to conn
+	t         *Transport
+	cacheKey  connectMethodKey
+	conn      net.Conn
+	br        *bufio.Reader       // from conn
+	bw        *bufio.Writer       // to conn
+	nwrite    int64               // bytes written
+	reqch     chan requestAndChan // written by roundTrip; read by readLoop
+	readLimit int64               // bytes allowed to be read; owned by readLoop
 
 	// Both guarded by Transport.idleMu:
 	idleAt    time.Time   // time it last become idle
@@ -692,6 +756,13 @@ type persistConn struct {
 
 	mu     sync.Mutex // guards following fields
 	closed error      // set non-nil when conn is closed, before closech is closed
+}
+
+func (pc *persistConn) maxHeaderResponseSize() int64 {
+	if v := pc.t.MaxResponseHeaderBytes; v != 0 {
+		return v
+	}
+	return 10 << 20 // conservative default; same as http2
 }
 
 // isBroken reports whether this connection is in a known broken state.
@@ -715,6 +786,75 @@ func (pc *persistConn) closeConnIfStillIdle() {
 	}
 	t.removeIdleConnLocked(pc)
 	pc.close(errIdleConnTimeout)
+}
+
+func (pc *persistConn) readLoop() {
+	closeErr := errReadLoopExiting // default value, if not changed below
+	defer func() {
+		pc.close(closeErr)
+		pc.t.removeIdleConn(pc)
+	}()
+
+	tryPutIdleConn := func(trace *httptrace.ClientTrace) bool {
+		if err := pc.t.tryPutIdleConn(pc); err != nil {
+			closeErr = err
+			return false
+		}
+		return true
+	}
+
+	// eofc is used to block caller goroutines reading from Response.Body
+	// at EOF until this goroutines has (potentially) added the connection
+	// back to the idle pool.
+	eofc := make(chan struct{})
+	defer close(eofc) // unblock reader on errors
+
+	alive := true
+	for alive {
+		pc.readLimit = pc.maxHeaderResponseSize()
+		_, err := pc.br.Peek(1)
+
+		pc.mu.Lock()
+		if pc.numExpectedResponses == 0 {
+			pc.readLoopPeekFailLocked(err)
+			pc.mu.Unlock()
+			return
+		}
+		pc.mu.Unlock()
+
+		rc := <-pc.reqch
+
+		var resp *Response
+		if err == nil {
+			resp, err = pc.readResponse(rc)
+		} else {
+			err = transportReadFromServerError{err}
+			closeErr = err
+		}
+	}
+}
+
+// readResponse reads an HTTP response (or two, in the case of "Expect:
+// 100-continue") from the server. It returns the final non-100 one.
+// trace is optional.
+func (pc *persistConn) readResponse(rc requestAndChan) (resp *Response, err error) {
+	for {
+		resp, err = ReadResponse(pc.br, rc.req)
+		if err != nil {
+			return
+		}
+		break
+	}
+
+	return
+}
+
+func (pc *persistConn) writeLoop() {
+
+}
+
+type requestAndChan struct {
+	req *Request
 }
 
 type httpError struct {

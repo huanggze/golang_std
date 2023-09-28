@@ -194,3 +194,20 @@ func (sd *sysDialer) dialSerial(ctx context.Context, ras addrList) (Conn, error)
 	}
 	return nil, firstErr
 }
+
+// dialSingle attempts to establish and returns a single connection to
+// the destination address.
+func (sd *sysDialer) dialSingle(ctx context.Context, ra Addr) (c Conn, err error) {
+	la := sd.LocalAddr
+	switch ra := ra.(type) {
+	case *TCPAddr:
+		la, _ := la.(*TCPAddr)
+		c, err = sd.dialTCP(ctx, la, ra)
+	default:
+		return nil, &OpError{Op: "dial", Net: sd.network, Source: la, Addr: ra, Err: &AddrError{Err: "unexpected address type", Addr: sd.address}}
+	}
+	if err != nil {
+		return nil, &OpError{Op: "dial", Net: sd.network, Source: la, Addr: ra, Err: err} // c is non-nil interface containing nil pointer
+	}
+	return c, nil
+}
